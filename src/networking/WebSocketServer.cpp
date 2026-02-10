@@ -113,9 +113,6 @@ private:
 
                         if (self->server_.on_message_) self->server_.on_message_(self->id_, msg);
 
-                        // Minimal behavior: echo back
-                        self->send("echo: " + msg);
-
                         self->do_read();
                     }));
         }

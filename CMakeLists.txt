@@ -11,12 +11,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Boost (Beast is header-only; Asio uses Boost::system)
-find_package(Boost REQUIRED COMPONENTS system)
+find_package(Boost REQUIRED COMPONENTS system json)
 
 add_executable(SimpleChat)
 
 target_include_directories(SimpleChat PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(SimpleChat PRIVATE Boost::system pthread)
+target_link_libraries(SimpleChat PRIVATE Boost::system Boost::json pthread)
 
 # Main entry
 target_sources(SimpleChat PRIVATE ${CMAKE_SOURCE_DIR}/src/SimpleChat.cpp)
