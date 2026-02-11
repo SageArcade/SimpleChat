@@ -1,4 +1,9 @@
 #include "networking/WebSocketServer.h"
+#include "networking/Session.hpp"
+#include "chat/Room.h"
+#include "chat/User.h"
+#include "chat/IDGenerator.hpp"
+
 
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/signal_set.hpp>
@@ -8,8 +13,11 @@
 #include <unordered_map>
 #include <iostream>
 
-static constexpr bool DEBUG_MODE = true;
 namespace json = boost::json;
+
+
+static constexpr bool DEBUG_MODE = true;
+static constexpr std::string_view kLobbyRoomId = "room-lobby";
 
 static std::string guest_name(simplechat::networking::ClientId id) {
     return "guest-" + std::to_string(id);
@@ -32,44 +40,104 @@ int main() {
 
     boost::asio::io_context ioc;
 
+    simplechat::chat::IDGenerator idgen;
+
     std::unordered_set<ClientId> clients;
-    std::unordered_map<ClientId, std::string> user_of;
-    std::unordered_map<ClientId, std::string> room_of; // default "lobby"
+    std::unordered_map<ClientId, simplechat::networking::Session> sessions;
+    std::unordered_map<std::string, simplechat::chat::User> users;
 
     unsigned short port = 9002;
     WebSocketServer server(ioc, port);
 
-    server.set_on_connect([&](ClientId id) {
-        clients.insert(id);
-        user_of[id] = guest_name(id);
-        room_of[id] = "lobby";
+    server.set_on_connect([&](ClientId client_id) {
+        clients.insert(client_id);
 
-        // welcome to this client only
-        server.send(id, dump({{"type","system"}, {"text","welcome to SimpleChat"}, {"room","lobby"}}));
+        simplechat::chat::User user{idgen, "guest", std::string(kLobbyRoomId)};
+        const std::string user_id = user.user_id();
+        users.emplace(user_id, std::move(user));
 
-        // notify everyone in lobby
-        json::object evt{{"type","system"}, {"text", user_of[id] + " joined lobby"}, {"room","lobby"}};
-        for (auto c : clients) {
-            if (room_of[c] == "lobby") server.send(c, dump(evt));
+        Session sess;
+        sess.client_id = idgen.clientID();
+        sess.user_id   = user_id;
+        sess.room_id   = std::string(kLobbyRoomId);
+
+        sessions.emplace(client_id, std::move(sess));
+
+        auto& current_session = sessions.at(client_id);
+        auto& current_user = users.at(current_session.user_id);
+
+        // 3) Welcome message (to this client only)
+        server.send(client_id, dump({
+            {"type", "system"},
+            {"text", "welcome to SimpleChat"},
+            {"client_id", current_session.client_id},
+            {"user_id", current_user.user_id()},
+            {"room_id", current_session.room_id}
+        }));
+
+        // 4) Notify everyone in lobby
+        json::object evt{
+            {"type", "system"},
+            {"text", current_user.name() + " joined lobby"},
+            {"user_id", current_user.user_id()},
+            {"room_id", current_session.room_id}
+        };
+
+        for (ClientId c : clients) {
+            auto it = sessions.find(c);
+            if (it != sessions.end() && it->second.room_id == current_session.room_id) {
+                server.send(c, dump(evt));
+            }
         }
+
     });
 
-    server.set_on_disconnect([&](ClientId id) {
-        auto user = user_of.count(id) ? user_of[id] : guest_name(id);
-        auto room = room_of.count(id) ? room_of[id] : "lobby";
+    server.set_on_disconnect([&](ClientId client_id) {
+        
+        std::string room_id = "room-lobby";
+        std::string username = "guest";
 
-        clients.erase(id);
-        user_of.erase(id);
-        room_of.erase(id);
+        auto session_iterator = sessions.find(client_id);
+        if (session_iterator != sessions.end()) {
+            room_id = session_iterator->second.room_id;
 
-        json::object evt{{"type","system"}, {"text", user + " left " + room}, {"room", room}};
+            auto user_iterator = users.find(session_iterator->second.user_id);
+            if (user_iterator != users.end()) username = user_iterator->second.name();
+        }
+
+        clients.erase(client_id);
+        sessions.erase(client_id);
+        // NOTE: don't erase user blindly if you later allow multiple sessions/user
+        // For now (1 session/user), you can erase user too:
+        if (session_iterator != sessions.end()) users.erase(session_iterator->second.user_id);
+
+        json::object evt{{"type","system"},
+                        {"text", username + " left " + room_id},
+                        {"room_id", room_id}};
+
         for (auto c : clients) {
-            if (room_of[c] == room) server.send(c, dump(evt));
+            auto it = sessions.find(c);
+            if (it != sessions.end() && it->second.room_id == room_id) {
+                server.send(c, dump(evt));
+            }
         } 
     });
 
-    server.set_on_message([&](ClientId id, const std::string &msg)
-                          {
+    server.set_on_message([&](ClientId id, const std::string &msg) {
+        auto sit = sessions.find(id);
+        if (sit == sessions.end()) {
+            server.send(id, dump({{"type","error"}, {"text","unknown session"}}));
+            return;
+        }
+        auto& sess = sit->second;
+    
+        auto uit = users.find(sess.user_id);
+        if (uit == users.end()) {
+            server.send(id, dump({{"type","error"}, {"text","unknown user"}}));
+            return;
+        }
+        auto& user = uit->second;
+    
         json::value v;
         try {
             v = json::parse(msg);
@@ -77,33 +145,42 @@ int main() {
             server.send(id, dump({{"type","error"}, {"text","invalid json"}}));
             return;
         }
-
+    
         auto* obj = v.if_object();
         if (!obj || !obj->if_contains("type")) {
             server.send(id, dump({{"type","error"}, {"text","missing type"}}));
             return;
         }
-
+    
         std::string type = json::value_to<std::string>((*obj)["type"]);
-
+    
         if (type == "join") {
-            // read optional room/user
-            if (obj->if_contains("user")) user_of[id] = json::value_to<std::string>((*obj)["user"]);
-            if (obj->if_contains("room")) room_of[id] = json::value_to<std::string>((*obj)["room"]);
-
+            // Only allow setting display name for now
+            if (obj->if_contains("user")) {
+                user.set_name(json::value_to<std::string>((*obj)["user"]));
+            }
+    
             // Debug reply (sender-only)
             server.send(id, dump({
                 {"type", "debug_join"},
-                {"client_id", id},
-                {"user", user_of[id]},
-                {"room", room_of[id]}
+                {"client_id", sess.client_id},
+                {"user_id", user.user_id()},
+                {"name", user.name()},
+                {"room_id", sess.room_id}
             }));
-
-            auto text = user_of[id] + " joined " + room_of[id];
-            json::object evt{{"type","system"}, {"text", text}, {"room", room_of[id]}};
-
+    
+            json::object evt{
+                {"type","system"},
+                {"text", user.name() + " joined " + sess.room_id},
+                {"user_id", user.user_id()},
+                {"room_id", sess.room_id}
+            };
+    
             for (auto c : clients) {
-                if (room_of[c] == room_of[id]) server.send(c, dump(evt));
+                auto it = sessions.find(c);
+                if (it != sessions.end() && it->second.room_id == sess.room_id) {
+                    server.send(c, dump(evt));
+                }
             }
         }
         else if (type == "msg") {
@@ -112,30 +189,36 @@ int main() {
                 return;
             }
             std::string text = json::value_to<std::string>((*obj)["text"]);
-
+    
             // Debug reply (sender-only)
             server.send(id, dump({
                 {"type", "debug_msg"},
-                {"client_id", id},
-                {"user", user_of[id]},
-                {"room", room_of[id]},
+                {"client_id", sess.client_id},
+                {"user_id", user.user_id()},
+                {"name", user.name()},
+                {"room_id", sess.room_id},
                 {"text", text}
             }));
-
+    
             json::object out{
                 {"type","msg"},
-                {"from", user_of[id]},
-                {"room", room_of[id]},
+                {"from", user.name()},
+                {"user_id", user.user_id()},
+                {"client_id", sess.client_id},
+                {"room_id", sess.room_id},
                 {"text", text}
             };
-
+    
             for (auto c : clients) {
-                if (room_of[c] == room_of[id]) server.send(c, dump(out));
+                auto it = sessions.find(c);
+                if (it != sessions.end() && it->second.room_id == sess.room_id) {
+                    server.send(c, dump(out));
+                }
             }
         }
         else {
             server.send(id, dump({{"type","error"}, {"text","unknown type"}}));
-        } 
+        }
     });
 
     server.start();

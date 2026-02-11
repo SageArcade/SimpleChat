@@ -36,3 +36,4 @@ endfunction()
 
 # Modules (just add folder names here as you grow)
 add_module(networking)
+add_module(chat)
