@@ -42,7 +42,6 @@ int main() {
 
     simplechat::chat::IDGenerator idgen;
 
-    std::unordered_set<ClientId> clients;
     std::unordered_map<ClientId, simplechat::networking::Session> sessions;
     std::unordered_map<std::string, simplechat::chat::User> users;
 
@@ -50,7 +49,6 @@ int main() {
     WebSocketServer server(ioc, port);
 
     server.set_on_connect([&](ClientId client_id) {
-        clients.insert(client_id);
 
         simplechat::chat::User user{idgen, "guest", std::string(kLobbyRoomId)};
         const std::string user_id = user.user_id();
@@ -82,11 +80,10 @@ int main() {
             {"user_id", current_user.user_id()},
             {"room_id", current_session.room_id}
         };
-
-        for (ClientId c : clients) {
-            auto it = sessions.find(c);
-            if (it != sessions.end() && it->second.room_id == current_session.room_id) {
-                server.send(c, dump(evt));
+        
+        for (const auto& [cid, sess] : sessions) {
+            if (sess.room_id == current_session.room_id) {
+                server.send(cid, dump(evt));
             }
         }
 
@@ -97,6 +94,7 @@ int main() {
         std::string room_id = "room-lobby";
         std::string username = "guest";
 
+        std::string user_id_to_erase;
         auto session_iterator = sessions.find(client_id);
         if (session_iterator != sessions.end()) {
             room_id = session_iterator->second.room_id;
@@ -105,8 +103,8 @@ int main() {
             if (user_iterator != users.end()) username = user_iterator->second.name();
         }
 
-        clients.erase(client_id);
         sessions.erase(client_id);
+        if (!user_id_to_erase.empty()) users.erase(user_id_to_erase);
         // NOTE: don't erase user blindly if you later allow multiple sessions/user
         // For now (1 session/user), you can erase user too:
         if (session_iterator != sessions.end()) users.erase(session_iterator->second.user_id);
@@ -114,26 +112,26 @@ int main() {
         json::object evt{{"type","system"},
                         {"text", username + " left " + room_id},
                         {"room_id", room_id}};
-
-        for (auto c : clients) {
-            auto it = sessions.find(c);
-            if (it != sessions.end() && it->second.room_id == room_id) {
-                server.send(c, dump(evt));
+        
+        auto& current_session = sessions.at(client_id);
+        for (const auto& [cid, sess] : sessions) {
+            if (sess.room_id == current_session.room_id) {
+                server.send(cid, dump(evt));
             }
-        } 
+        }
     });
 
-    server.set_on_message([&](ClientId id, const std::string &msg) {
-        auto sit = sessions.find(id);
+    server.set_on_message([&](ClientId client_id, const std::string &msg) {
+        auto sit = sessions.find(client_id);
         if (sit == sessions.end()) {
-            server.send(id, dump({{"type","error"}, {"text","unknown session"}}));
+            server.send(client_id, dump({{"type","error"}, {"text","unknown session"}}));
             return;
         }
         auto& sess = sit->second;
     
         auto uit = users.find(sess.user_id);
         if (uit == users.end()) {
-            server.send(id, dump({{"type","error"}, {"text","unknown user"}}));
+            server.send(client_id, dump({{"type","error"}, {"text","unknown user"}}));
             return;
         }
         auto& user = uit->second;
@@ -142,13 +140,13 @@ int main() {
         try {
             v = json::parse(msg);
         } catch (...) {
-            server.send(id, dump({{"type","error"}, {"text","invalid json"}}));
+            server.send(client_id, dump({{"type","error"}, {"text","invalid json"}}));
             return;
         }
     
         auto* obj = v.if_object();
         if (!obj || !obj->if_contains("type")) {
-            server.send(id, dump({{"type","error"}, {"text","missing type"}}));
+            server.send(client_id, dump({{"type","error"}, {"text","missing type"}}));
             return;
         }
     
@@ -161,7 +159,7 @@ int main() {
             }
     
             // Debug reply (sender-only)
-            server.send(id, dump({
+            server.send(client_id, dump({
                 {"type", "debug_join"},
                 {"client_id", sess.client_id},
                 {"user_id", user.user_id()},
@@ -175,23 +173,23 @@ int main() {
                 {"user_id", user.user_id()},
                 {"room_id", sess.room_id}
             };
-    
-            for (auto c : clients) {
-                auto it = sessions.find(c);
-                if (it != sessions.end() && it->second.room_id == sess.room_id) {
-                    server.send(c, dump(evt));
+
+            auto& current_session = sessions.at(client_id);
+            for (const auto& [cid, sess] : sessions) {
+                if (sess.room_id == current_session.room_id) {
+                    server.send(cid, dump(evt));
                 }
             }
         }
         else if (type == "msg") {
             if (!obj->if_contains("text")) {
-                server.send(id, dump({{"type","error"}, {"text","missing text"}}));
+                server.send(client_id, dump({{"type","error"}, {"text","missing text"}}));
                 return;
             }
             std::string text = json::value_to<std::string>((*obj)["text"]);
     
             // Debug reply (sender-only)
-            server.send(id, dump({
+            server.send(client_id, dump({
                 {"type", "debug_msg"},
                 {"client_id", sess.client_id},
                 {"user_id", user.user_id()},
@@ -208,16 +206,9 @@ int main() {
                 {"room_id", sess.room_id},
                 {"text", text}
             };
-    
-            for (auto c : clients) {
-                auto it = sessions.find(c);
-                if (it != sessions.end() && it->second.room_id == sess.room_id) {
-                    server.send(c, dump(out));
-                }
-            }
         }
         else {
-            server.send(id, dump({{"type","error"}, {"text","unknown type"}}));
+            server.send(client_id, dump({{"type","error"}, {"text","unknown type"}}));
         }
     });
 
